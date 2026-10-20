@@ -78,6 +78,8 @@ nonisolated struct CodexUsageWindow: Sendable {
 nonisolated struct CodexUsageSnapshot: Sendable {
     let fiveHour: CodexUsageWindow?
     let weekly: CodexUsageWindow?
+    /// The free plan only has a 30-day window.
+    let monthly: CodexUsageWindow?
     let fetchedAt: Date
 }
 
@@ -86,6 +88,7 @@ final class CodexUsageStore: ObservableObject {
     @Published private(set) var snapshot: CodexUsageSnapshot?
     @Published private(set) var isRefreshing = false
     @Published private(set) var message: String?
+    @Published private(set) var plan: String?
 
     private let client = CodexUsageClient()
     private var pollingTask: Task<Void, Never>?
@@ -135,8 +138,9 @@ final class CodexUsageStore: ObservableObject {
         defer { isRefreshing = false }
 
         do {
-            let newSnapshot = try await client.fetch()
-            snapshot = newSnapshot
+            let fetched = try await client.fetch()
+            snapshot = fetched.snapshot
+            plan = fetched.plan
             message = nil
         } catch {
             message = error.localizedDescription
@@ -145,9 +149,15 @@ final class CodexUsageStore: ObservableObject {
 }
 
 private actor CodexUsageClient {
-    func fetch() async throws -> CodexUsageSnapshot {
-        let executable = try codexExecutableURL()
-        return try await AppServerRequest(executableURL: executable).run()
+    func fetch() async throws -> AppServerRequest.Response {
+        do {
+            let executable = try codexExecutableURL()
+            return try await AppServerRequest(executableURL: executable).run()
+        } catch {
+            // Without a working CLI, ask the same usage endpoint directly with Codex's saved login.
+            if let fallback = try? await CodexAuthFileUsage.fetch() { return fallback }
+            throw error
+        }
     }
 
     private func codexExecutableURL() throws -> URL {
@@ -176,6 +186,8 @@ private actor CodexUsageClient {
 }
 
 private nonisolated final class AppServerRequest: @unchecked Sendable {
+    typealias Response = (snapshot: CodexUsageSnapshot, plan: String?)
+
     private let executableURL: URL
     private let process = Process()
     private let inputPipe = Pipe()
@@ -183,13 +195,17 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var isFinished = false
-    private var continuation: CheckedContinuation<CodexUsageSnapshot, Error>?
+    private var snapshot: CodexUsageSnapshot?
+    private var accountPlan: String?
+    private var rateLimitPlan: String?
+    private var accountAnswered = false
+    private var continuation: CheckedContinuation<Response, Error>?
 
     init(executableURL: URL) {
         self.executableURL = executableURL
     }
 
-    func run() async throws -> CodexUsageSnapshot {
+    func run() async throws -> Response {
         try await withCheckedThrowingContinuation { continuation in
             lock.lock()
             self.continuation = continuation
@@ -208,7 +224,7 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
             }
 
             process.terminationHandler = { [weak self] process in
-                self?.finish(.failure(CodexUsageError.serverStopped))
+                self?.finish(orFailWith: CodexUsageError.serverStopped)
             }
 
             do {
@@ -220,7 +236,7 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
             }
 
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) { [weak self] in
-                self?.finish(.failure(CodexUsageError.timedOut))
+                self?.finish(orFailWith: CodexUsageError.timedOut)
             }
         }
     }
@@ -246,6 +262,17 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
                 continue
             }
 
+            // The plan is a nice-to-have, so a failed `account/read` still returns the rate limits.
+            if responseID == 3 {
+                let accountPlan = Self.parsePlan(from: object)
+                lock.lock()
+                accountAnswered = true
+                self.accountPlan = accountPlan
+                lock.unlock()
+                finishIfComplete()
+                continue
+            }
+
             if let error = object["error"] as? [String: Any] {
                 let detail = error["message"] as? String ?? "Codex returned an error."
                 finish(.failure(CodexUsageError.serverError(detail)))
@@ -264,15 +291,40 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
             guard responseID == 2 else { continue }
 
             do {
-                finish(.success(try Self.parseSnapshot(from: object)))
+                let newSnapshot = try Self.parseSnapshot(from: object)
+                let rateLimitPlan = Self.parsePlan(from: object)
+                lock.lock()
+                snapshot = newSnapshot
+                self.rateLimitPlan = rateLimitPlan
+                lock.unlock()
+                finishIfComplete()
             } catch {
                 finish(.failure(error))
+                return
             }
-            return
         }
     }
 
-    private func finish(_ result: Result<CodexUsageSnapshot, Error>) {
+    private func finishIfComplete() {
+        lock.lock()
+        let isComplete = snapshot != nil && accountAnswered
+        lock.unlock()
+
+        if isComplete {
+            finish(orFailWith: CodexUsageError.invalidResponse)
+        }
+    }
+
+    /// Returns the rate limits if they arrived, even when the plan didn't.
+    private func finish(orFailWith error: Error) {
+        lock.lock()
+        let response = snapshot.map { (snapshot: $0, plan: accountPlan ?? rateLimitPlan) }
+        lock.unlock()
+
+        finish(response.map { .success($0) } ?? .failure(error))
+    }
+
+    private func finish(_ result: Result<Response, Error>) {
         lock.lock()
         guard !isFinished else {
             lock.unlock()
@@ -302,6 +354,7 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
         """
         {"method":"initialized"}
         {"id":2,"method":"account/rateLimits/read","params":null}
+        {"id":3,"method":"account/read","params":{}}
 
         """.utf8
     )
@@ -319,12 +372,27 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
             .compactMap(parseWindow)
         let fiveHour = matchingWindow(minutes: 300, in: baseWindows)
         let weekly = matchingWindow(minutes: 10_080, in: baseWindows)
+        let monthly = baseWindows.first { (40_000...45_000).contains($0.windowMinutes) }
 
-        guard fiveHour != nil || weekly != nil else {
+        guard fiveHour != nil || weekly != nil || monthly != nil else {
             throw CodexUsageError.noLimits
         }
 
-        return CodexUsageSnapshot(fiveHour: fiveHour, weekly: weekly, fetchedAt: Date())
+        return CodexUsageSnapshot(fiveHour: fiveHour, weekly: weekly, monthly: monthly, fetchedAt: Date())
+    }
+
+    /// `account/read` reports `result.account.planType`; `account/rateLimits/read` reports `result.rateLimits.planType`.
+    private static func parsePlan(from response: [String: Any]) -> String? {
+        guard let result = response["result"] as? [String: Any],
+              let container = (result["account"] ?? result["rateLimits"]) as? [String: Any],
+              let planType = (container["planType"] as? String)?.lowercased(),
+              !planType.isEmpty, planType != "unknown" else {
+            return nil
+        }
+
+        if planType.contains("enterprise") { return "Enterprise" }
+        if planType.contains("business") { return "Business" }
+        return planType.replacingOccurrences(of: "_", with: " ").capitalized
     }
 
     private static func parseWindow(_ value: Any?) -> CodexUsageWindow? {
@@ -351,6 +419,65 @@ private nonisolated final class AppServerRequest: @unchecked Sendable {
 
 }
 
+/// `chatgpt.com/backend-api/wham/usage` with the ChatGPT login Codex saved in `~/.codex/auth.json`
+/// (or `$CODEX_HOME`). Read-only: tokens are never refreshed here, so Codex's own login isn't rotated.
+private nonisolated enum CodexAuthFileUsage {
+    static func fetch() async throws -> AppServerRequest.Response {
+        let home = ProcessInfo.processInfo.environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        guard let data = try? Data(contentsOf: home.appendingPathComponent("auth.json")),
+              let auth = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = auth["tokens"] as? [String: Any],
+              let token = tokens["access_token"] as? String, !token.isEmpty,
+              let url = URL(string: "https://chatgpt.com/backend-api/wham/usage") else {
+            throw CodexUsageError.invalidResponse
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("ousage", forHTTPHeaderField: "User-Agent")
+        if let account = tokens["account_id"] as? String, !account.isEmpty {
+            request.setValue(account, forHTTPHeaderField: "ChatGPT-Account-Id")
+        }
+
+        let (body, response) = try await URLSession.shared.data(for: request)
+        guard let status = (response as? HTTPURLResponse)?.statusCode else { throw CodexUsageError.invalidResponse }
+        guard (200..<300).contains(status) else {
+            throw CodexUsageError.serverError(status == 401 || status == 403
+                ? "Codex’s saved sign-in was rejected. Run `codex` to sign in again."
+                : "Codex usage request failed (HTTP \(status)).")
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let limits = object["rate_limit"] as? [String: Any] else {
+            throw CodexUsageError.invalidResponse
+        }
+
+        let windows = [limits["primary_window"], limits["secondary_window"]].compactMap { value -> CodexUsageWindow? in
+            guard let raw = value as? [String: Any],
+                  let used = (raw["used_percent"] as? NSNumber)?.doubleValue,
+                  let seconds = (raw["limit_window_seconds"] as? NSNumber)?.doubleValue else { return nil }
+            let reset = (raw["reset_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            return CodexUsageWindow(usedPercent: used, windowMinutes: seconds / 60, resetsAt: reset)
+        }
+        let fiveHour = windows.first { abs($0.windowMinutes - 300) <= 2 }
+        let weekly = windows.first { abs($0.windowMinutes - 10_080) <= 2 }
+        let monthly = windows.first { (40_000...45_000).contains($0.windowMinutes) }
+        guard fiveHour != nil || weekly != nil || monthly != nil else { throw CodexUsageError.noLimits }
+
+        let planType = (object["plan_type"] as? String)?.lowercased()
+        let plan: String? = switch planType {
+        case nil, "", "unknown": nil
+        case let type? where type.contains("enterprise"): "Enterprise"
+        case let type? where type.contains("business"): "Business"
+        case let type?: type.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+
+        return (CodexUsageSnapshot(fiveHour: fiveHour, weekly: weekly, monthly: monthly, fetchedAt: Date()), plan)
+    }
+}
+
 private enum CodexUsageError: LocalizedError {
     case cliNotFound
     case couldNotStart(String)
@@ -373,7 +500,7 @@ private enum CodexUsageError: LocalizedError {
         case .invalidResponse:
             return "Codex returned usage in an unexpected format."
         case .noLimits:
-            return "Codex did not report a 5-hour or weekly usage window."
+            return "Codex did not report a usage window."
         case .timedOut:
             return "Codex took too long to return usage."
         }
